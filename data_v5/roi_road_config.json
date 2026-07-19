@@ -1,0 +1,28 @@
+{
+  "y_top": 0.36,
+  "y_bot": 0.92,
+  "left_road": {
+    "top_left_x": 0.27,
+    "top_right_x": 0.49,
+    "bottom_left_x": 0.0,
+    "bottom_right_x": 0.31,
+    "y_top": 0.36,
+    "y_bot": 0.92
+  },
+  "right_road": {
+    "top_left_x": 0.57,
+    "top_right_x": 0.67,
+    "bottom_left_x": 0.57,
+    "bottom_right_x": 0.97,
+    "y_top": 0.3,
+    "y_bot": 0.92
+  },
+  "median": {
+    "top_left_x": 0.37,
+    "top_right_x": 0.52,
+    "bottom_right_x": 0.57,
+    "bottom_left_x": 0.43,
+    "y_top": 0.51,
+    "y_bot": 0.96
+  }
+}
