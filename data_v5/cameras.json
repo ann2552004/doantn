@@ -1,0 +1,23 @@
+[
+  {
+    "camera_id": "CAM_01",
+    "ten_camera": "Camera KM10",
+    "duong_dan_video": "C:\\do an\\video\\video_1.mp4",
+    "vi_tri": "KM10",
+    "kich_hoat": true
+  },
+  {
+    "camera_id": "CAM_02",
+    "ten_camera": "Camera KM15",
+    "duong_dan_video": "C:\\do an\\video\\recording.mp4",
+    "vi_tri": "KM15",
+    "kich_hoat": true
+  },
+  {
+    "camera_id": "CAM_03",
+    "ten_camera": "Camera KM20",
+    "duong_dan_video": "C:\\do an\\video\\video_1.mp4",
+    "vi_tri": "KM20",
+    "kich_hoat": true
+  }
+]

@@ -81,17 +81,18 @@ def ghi_log(message: str):
 # =========================================================
 # CẤU HÌNH ĐO TỐC ĐỘ TỪNG XE
 # =========================================================
-SPEED_LINE_A_RATIO = 0.43
-SPEED_LINE_B_RATIO = 0.70
+SPEED_LINE_A_RATIO = 0.38
+SPEED_LINE_B_RATIO = 0.62
 SPEED_DISTANCE_METERS = 50.0
 
 SPEED_MIN_FRAMES_BETWEEN_LINES = 6
 SPEED_MIN_KMH = 5.0
 SPEED_MAX_KMH = 160.0
+SPEED_MIN_DISPLAY_KMH = int(os.getenv("VSL_MIN_DISPLAY_SPEED", "40"))
 
-SPEED_TRACK_TTL = 60
+SPEED_TRACK_TTL = 30
 SPEED_IOU_MATCH_TH = 0.15
-SPEED_CENTER_MATCH_PX = 130
+SPEED_CENTER_MATCH_PX = 160
 
 SPEED_CONFIG_FILE = DATA_DIR / "speed_profiles.json"
 
@@ -1228,6 +1229,66 @@ def _bbox_iou(box_a, box_b):
     return inter / float(area_a + area_b - inter + 1e-6)
 
 
+def _speed_confirm_from_measurements(tr, frame_idx, tid=None, log_func=None):
+    measurements = tr.setdefault("measurements", [])
+    if len(measurements) < 2:
+        return None
+
+    recent = measurements[-3:]
+    speeds = [float(item.get("speed", 0.0) or 0.0) for item in recent]
+    speeds = [s for s in speeds if SPEED_MIN_KMH <= s <= SPEED_MAX_KMH]
+    if len(speeds) < 2:
+        return None
+
+    if len(speeds) >= 3:
+        ordered = sorted(speeds)
+        candidate_values = ordered[1:] if abs(ordered[0] - ordered[1]) > 25 else ordered[:2]
+        if len(candidate_values) < 2:
+            candidate_values = ordered[-2:]
+        spread = max(candidate_values) - min(candidate_values)
+        candidate = sum(candidate_values) / len(candidate_values)
+    else:
+        spread = abs(speeds[-1] - speeds[-2])
+        candidate = (speeds[-1] + speeds[-2]) / 2.0
+
+    if spread > 25:
+        return None
+
+    if candidate < SPEED_MIN_DISPLAY_KMH:
+        if log_func is not None:
+            try:
+                log_func(
+                    f"[SPEED REJECT] ID={tid} speed={candidate:.1f} "
+                    "ly_do=duoi nguong cao toc / chua xac nhan lan 2"
+                )
+            except Exception:
+                pass
+        return None
+
+    confirmed = round(float(candidate), 1)
+    tr["confirmed_speed_kmh"] = confirmed
+    tr["speed_kmh"] = confirmed
+    tr["speed"] = confirmed
+    tr["confirmed_frame"] = frame_idx
+    return confirmed
+
+
+def _speed_add_measurement(tr, kind, speed, frame_idx, tid=None, log_func=None):
+    try:
+        speed = float(speed)
+    except Exception:
+        return None
+    if not (SPEED_MIN_KMH <= speed <= SPEED_MAX_KMH):
+        return None
+    measurements = tr.setdefault("measurements", [])
+    if measurements and measurements[-1].get("type") == kind and measurements[-1].get("frame") == frame_idx:
+        return _speed_confirm_from_measurements(tr, frame_idx, tid, log_func)
+    measurements.append({"type": kind, "speed": round(speed, 1), "frame": int(frame_idx)})
+    tr["measurements"] = measurements[-8:]
+    tr["last_measure_frame"] = int(frame_idx)
+    return _speed_confirm_from_measurements(tr, frame_idx, tid, log_func)
+
+
 class BoDoTocDoHaiVach:
     def __init__(self):
         self.next_id = 1
@@ -1245,24 +1306,35 @@ class BoDoTocDoHaiVach:
             if tr.get("name") != name:
                 continue
 
-            same_lane = (
-                lane_label is None or
-                tr.get("lane_label") is None or
-                tr.get("lane_label") == lane_label
-            )
-            if not same_lane:
+            old_lane = tr.get("lane_label")
+            if old_lane is not None and lane_label is not None and old_lane != lane_label:
                 continue
 
             iou = _bbox_iou(box, tr["box"])
             px, py = tr["center"]
             cx, cy = center
             dist = ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5
-            score = iou * 2.0 + max(0.0, 1.0 - dist / max(1.0, SPEED_CENTER_MATCH_PX))
+            if dist > min(160.0, float(SPEED_CENTER_MATCH_PX)):
+                continue
 
-            if iou >= SPEED_IOU_MATCH_TH or dist <= SPEED_CENTER_MATCH_PX:
-                if score > best_score:
-                    best_score = score
-                    best_id = tid
+            dy = cy - py
+            direction = tr.get("direction")
+            if direction is not None and dy * float(direction) < -35:
+                continue
+
+            bw_old = max(1, tr["box"][2] - tr["box"][0])
+            bh_old = max(1, tr["box"][3] - tr["box"][1])
+            bw_new = max(1, box[2] - box[0])
+            bh_new = max(1, box[3] - box[1])
+            if max(bw_old, bw_new) / max(1, min(bw_old, bw_new)) > 2.3:
+                continue
+            if max(bh_old, bh_new) / max(1, min(bh_old, bh_new)) > 2.3:
+                continue
+
+            score = iou * 2.0 + max(0.0, 1.0 - dist / max(1.0, float(SPEED_CENTER_MATCH_PX)))
+            if score > best_score:
+                best_score = score
+                best_id = tid
 
         return best_id
 
@@ -1302,11 +1374,18 @@ class BoDoTocDoHaiVach:
                     "line_a_frame": None,
                     "line_b_frame": None,
                     "speed_kmh": None,
+                    "confirmed_speed_kmh": None,
+                    "measurements": [],
+                    "last_measure_frame": -999,
+                    "direction": None,
+                    "last_centers": deque(maxlen=8),
+                    "ab_measured": False,
                 }
 
             tr = self.tracks[tid]
             prev_cx, prev_cy = tr["center"]
             cur_cx, cur_cy = center
+            tr.setdefault("last_centers", deque(maxlen=8)).append((int(frame_idx), cur_cx, cur_cy))
 
             cross_a = (prev_cy < y_a <= cur_cy) or (prev_cy > y_a >= cur_cy)
             cross_b = (prev_cy < y_b <= cur_cy) or (prev_cy > y_b >= cur_cy)
@@ -1316,13 +1395,30 @@ class BoDoTocDoHaiVach:
             if cross_b and tr["line_b_frame"] is None:
                 tr["line_b_frame"] = frame_idx
 
-            if tr["line_a_frame"] is not None and tr["line_b_frame"] is not None and tr["speed_kmh"] is None:
+            if tr["line_a_frame"] is not None and tr["line_b_frame"] is not None and not tr.get("ab_measured"):
                 df = abs(tr["line_b_frame"] - tr["line_a_frame"])
                 if df >= SPEED_MIN_FRAMES_BETWEEN_LINES:
                     dt = df / max(1.0, float(fps_video))
                     speed = distance_m / dt * 3.6
                     if SPEED_MIN_KMH <= speed <= SPEED_MAX_KMH:
-                        tr["speed_kmh"] = round(float(speed), 1)
+                        tr["ab_measured"] = True
+                        _speed_add_measurement(tr, "AB", speed, frame_idx, tid, ghi_log)
+
+            centers = list(tr.get("last_centers", []))
+            if len(centers) >= 5 and int(frame_idx) - int(tr.get("last_measure_frame", -999)) >= SPEED_MIN_FRAMES_BETWEEN_LINES:
+                f0, x0, y0 = centers[0]
+                f1, x1c, y1c = centers[-1]
+                df2 = abs(int(f1) - int(f0))
+                if df2 > 0:
+                    px_dist = ((x1c - x0) ** 2 + (y1c - y0) ** 2) ** 0.5
+                    meters_per_pixel = float(distance_m) / max(1.0, abs(y_b - y_a))
+                    dt2 = df2 / max(1.0, float(fps_video))
+                    speed_motion = px_dist * meters_per_pixel / max(1e-6, dt2) * 3.6
+                    _speed_add_measurement(tr, "MOTION", speed_motion, frame_idx, tid, ghi_log)
+
+            dy_now = cur_cy - prev_cy
+            if abs(dy_now) >= 2:
+                tr["direction"] = 1 if dy_now > 0 else -1
 
             tr["center"] = center
             tr["box"] = box
@@ -1330,12 +1426,17 @@ class BoDoTocDoHaiVach:
             tr["lane_label"] = lane_label
             tr["ttl"] = SPEED_TRACK_TTL
 
-            measured.append((tid, tr.get("speed_kmh"), box, lane_label))
+            measured.append((tid, tr.get("confirmed_speed_kmh"), box, lane_label))
 
         return measured
 
     def lay_toc_do(self):
-        speeds = [tr["speed_kmh"] for tr in self.tracks.values() if tr.get("speed_kmh") is not None]
+        speeds = [
+            tr["confirmed_speed_kmh"]
+            for tr in self.tracks.values()
+            if tr.get("confirmed_speed_kmh") is not None
+            and tr.get("confirmed_speed_kmh") >= SPEED_MIN_DISPLAY_KMH
+        ]
         return speeds[-20:]
 
 # =========================================================
@@ -1823,52 +1924,134 @@ ul {{ background:white; border:1px solid #dbe5f2; border-radius:16px; padding:18
                         cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 0), 2, cv2.LINE_AA)
 
         if self.config.display.show_boxes:
-            for x1, y1, x2, y2, name, confv, color, cx, cy, in_roi, lane_label in self.last_inference_boxes:
-                thickness = 2 if in_roi else 1
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
-                cv2.circle(frame, (cx, cy), 4 if in_roi else 2, (0, 255, 255) if in_roi else color, -1)
+            try:
+                current_vsl = int(float(vsl_speed))
+            except Exception:
+                current_vsl = 0
+            tolerance = 5
+            frame_idx = int(getattr(self, "frame_idx", 0))
+            violation_saved = getattr(self, "violation_saved", None)
+            if not isinstance(violation_saved, dict):
+                violation_saved = {}
+                self.violation_saved = violation_saved
 
+            for x1, y1, x2, y2, name, confv, color, cx, cy, in_roi, lane_label in self.last_inference_boxes:
                 box_key = (int(x1), int(y1), int(x2), int(y2))
-                speed_info = speed_by_box.get(box_key, {}) if 'speed_by_box' in locals() else {}
+                speed_info = speed_by_box.get(box_key, {})
                 speed_id = speed_info.get("id")
                 speed_kmh = speed_info.get("speed_kmh")
 
-                label_text = f"{name} {confv:.2f}"
+                try:
+                    speed_value = float(speed_kmh) if speed_kmh is not None else None
+                except Exception:
+                    speed_value = None
 
+                is_valid_speed = speed_value is not None and speed_value > 0
+                is_violation = bool(
+                    is_valid_speed
+                    and current_vsl > 0
+                    and speed_value > current_vsl + tolerance
+                )
+                box_color = (0, 0, 255) if is_violation else color
+                thickness = 3 if is_violation else (2 if in_roi else 1)
+
+                cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, thickness)
+                cv2.circle(
+                    frame,
+                    (cx, cy),
+                    4 if in_roi else 2,
+                    (0, 255, 255) if in_roi else box_color,
+                    -1,
+                )
+
+                label_text = f"{name} {confv:.2f}"
                 if speed_id is not None:
                     label_text += f" | ID {speed_id}"
 
-                if speed_kmh is not None:
-                    label_text += f" | {float(speed_kmh):.1f} km/h"
-                elif in_roi:
-                    label_text += " | đo..."
+                if not is_valid_speed:
+                    label_text += " | dang do toc do..."
+                elif is_violation:
+                    label_text += f" | VI PHAM | {speed_value:.1f}>{current_vsl} km/h"
+                else:
+                    label_text += f" | {speed_value:.1f} km/h"
 
                 if lane_label:
                     label_text += f" | {lane_label}"
 
+                label_y = max(24, y1 - 8)
                 cv2.putText(
                     frame,
                     label_text,
-                    (x1, max(24, y1 - 8)),
+                    (x1, label_y),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.55,
-                    color,
+                    (255, 255, 255) if is_violation else box_color,
                     2,
                     cv2.LINE_AA,
                 )
 
-                # Dòng tốc độ riêng bên dưới box để dễ nhìn.
-                if speed_kmh is not None:
+                if is_valid_speed:
                     cv2.putText(
                         frame,
-                        f"{float(speed_kmh):.1f} km/h",
+                        f"{speed_value:.1f} km/h",
                         (x1, min(h - 8, y2 + 22)),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.62,
-                        (0, 255, 255),
+                        (0, 0, 255) if is_violation else (0, 255, 255),
                         2,
                         cv2.LINE_AA,
                     )
+
+                if is_violation:
+                    vsl_text_y = min(h - 8, y2 + 42)
+                    cv2.putText(
+                        frame,
+                        f"VSL: {current_vsl} km/h",
+                        (x1, vsl_text_y),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.50,
+                        (255, 255, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
+
+                    key = f"{speed_id}_{current_vsl}"
+                    now = time.time()
+                    last_save = float(violation_saved.get(key, 0.0) or 0.0)
+                    if now - last_save >= 5.0:
+                        try:
+                            snapshot_root = Path(
+                                getattr(self, "snapshots_dir", Path(OUTPUT_DIR) / "snapshots")
+                            )
+                            violation_dir = snapshot_root / "violations"
+                            violation_dir.mkdir(parents=True, exist_ok=True)
+                            speed_text = f"{speed_value:.1f}".replace("/", "_")
+                            stamp = time.strftime("%Y%m%d_%H%M%S")
+                            image_path = violation_dir / (
+                                f"vi_pham_ID{speed_id}_speed{speed_text}_"
+                                f"vsl{current_vsl}_frame{frame_idx}_{stamp}.jpg"
+                            )
+                            if cv2.imwrite(str(image_path), frame):
+                                violation_saved[key] = now
+                                self.snapshot_count += 1
+                                if hasattr(self, "warning_count"):
+                                    self.warning_count += 1
+                                message = (
+                                    f"Xe ID {speed_id} vuot VSL: "
+                                    f"{speed_value:.1f} km/h > {current_vsl} km/h"
+                                )
+                                try:
+                                    self.them_su_kien("VIOLATION", message, t_sec)
+                                except Exception:
+                                    try:
+                                        self.them_nhat_ky(message)
+                                    except Exception:
+                                        pass
+                        except Exception as exc:
+                            try:
+                                self.them_nhat_ky(f"Loi luu anh vi pham: {exc}")
+                            except Exception:
+                                pass
 
         lane_text = " | ".join([f"{k}:{v}" for k, v in lane_counts.items()]) if lane_counts else "ROI thủ công"
         self.last_stats = {
@@ -8428,15 +8611,15 @@ except Exception:
 # PATCH ĐO TỐC ĐỘ THẬT HƠN BẰNG 2 VẠCH XA NHAU
 # =========================================================
 
-SPEED_LINE_A_RATIO = 0.43
-SPEED_LINE_B_RATIO = 0.70
+SPEED_LINE_A_RATIO = 0.38
+SPEED_LINE_B_RATIO = 0.62
 SPEED_DISTANCE_METERS = 50.0
 
 SPEED_X_MIN_RATIO = 0.12
 SPEED_X_MAX_RATIO = 0.88
 
-SPEED_MAX_MATCH_DISTANCE = 75
-SPEED_TRACK_TTL = 90
+SPEED_MAX_MATCH_DISTANCE = 160
+SPEED_TRACK_TTL = 30
 SPEED_MIN_BOX_W = 30
 SPEED_MIN_BOX_H = 30
 
@@ -9914,9 +10097,9 @@ def _final_draw_roi(frame, rois, median, lanes, line_a_y, line_b_y, distance_m):
                 x0, x1 = seg
                 cv2.line(frame, (x0 + 2, y), (x1 - 2, y), color, 2)
 
-    cv2.putText(frame, "SPEED LINE A - MOI LAN", (30, line_a_y - 8),
+    cv2.putText(frame, "A - bat dau do", (30, line_a_y - 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 0), 2, cv2.LINE_AA)
-    cv2.putText(frame, f"SPEED LINE B - MOI LAN | {distance_m:.0f}m", (30, line_b_y - 8),
+    cv2.putText(frame, f"B - ket thuc do | {distance_m:.0f}m", (30, line_b_y - 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 255, 255), 2, cv2.LINE_AA)
 
 
@@ -9927,9 +10110,10 @@ def _final_speed_init(self):
         self.speed_done_final_roi = []
         self.speed_by_lane_final_roi = {}
         self.speed_distance_m_chuan = float(getattr(self, "speed_distance_m_chuan", 50.0))
-        self.speed_track_timeout_frames = 75
+        self.speed_track_timeout_frames = 30
         self.speed_min_kmh = 5.0
         self.speed_max_kmh = 180.0
+        self.speed_min_display_kmh = SPEED_MIN_DISPLAY_KMH
 
 
 def _final_iou(a, b):
@@ -9956,16 +10140,35 @@ def _final_match_track(self, name, lane, bbox, foot):
             continue
         tx, ty = tr.get("foot", foot)
         dist = ((fx - tx) ** 2 + (fy - ty) ** 2) ** 0.5
-        score = _final_iou(bbox, tr.get("bbox", bbox)) * 2.2 - dist / 150.0
+        if dist > 160.0:
+            continue
+        dy = fy - ty
+        direction = tr.get("direction")
+        if direction is not None and dy * float(direction) < -35:
+            continue
+        old_box = tr.get("bbox", bbox)
+        old_w = max(1, old_box[2] - old_box[0])
+        old_h = max(1, old_box[3] - old_box[1])
+        new_w = max(1, bbox[2] - bbox[0])
+        new_h = max(1, bbox[3] - bbox[1])
+        if max(old_w, new_w) / max(1, min(old_w, new_w)) > 2.3:
+            continue
+        if max(old_h, new_h) / max(1, min(old_h, new_h)) > 2.3:
+            continue
+        score = _final_iou(bbox, old_box) * 2.2 + max(0.0, 1.0 - dist / 160.0)
         if score > best_score:
             best, best_score = tid, score
-    if best is None or best_score < -0.35:
+    if best is None or best_score <= 0.0:
         best = self.speed_next_id_final_roi
         self.speed_next_id_final_roi += 1
         self.speed_tracks_final_roi[best] = {
             "name": name, "lane": lane, "bbox": bbox, "foot": foot,
             "last_y": foot[1], "last_frame": self.frame_idx,
             "time_a": None, "time_b": None, "speed": None,
+            "confirmed_speed_kmh": None, "measurements": [],
+            "last_measure_frame": -999, "direction": None,
+            "last_centers": deque(maxlen=8), "ab_measured": False,
+            "confirmed_recorded": False,
         }
     return best
 
@@ -9976,23 +10179,48 @@ def _final_update_speed(self, tid, lane, bbox, foot, line_a_y, line_b_y, t_sec):
     cy = int(foot[1])
     crossed_a = (last_y <= line_a_y <= cy) or (last_y >= line_a_y >= cy)
     crossed_b = (last_y <= line_b_y <= cy) or (last_y >= line_b_y >= cy)
+    centers = tr.setdefault("last_centers", deque(maxlen=8))
+    centers.append((int(self.frame_idx), int(foot[0]), int(foot[1])))
     if tr.get("time_a") is None and crossed_a:
         tr["time_a"] = float(t_sec)
     if tr.get("time_b") is None and crossed_b:
         tr["time_b"] = float(t_sec)
-    if tr.get("speed") is None and tr.get("time_a") is not None and tr.get("time_b") is not None:
+    if tr.get("time_a") is not None and tr.get("time_b") is not None and not tr.get("ab_measured"):
         dt = abs(float(tr["time_b"]) - float(tr["time_a"]))
         if dt > 0.08:
             kmh = float(self.speed_distance_m_chuan) / dt * 3.6
             if self.speed_min_kmh <= kmh <= self.speed_max_kmh:
-                sp = round(kmh, 1)
-                tr["speed"] = sp
-                self.speed_done_final_roi.append(sp)
-                self.speed_done_final_roi = self.speed_done_final_roi[-200:]
-                self.speed_by_lane_final_roi.setdefault(lane, []).append(sp)
-                self.speed_by_lane_final_roi[lane] = self.speed_by_lane_final_roi[lane][-80:]
+                tr["ab_measured"] = True
+                _speed_add_measurement(tr, "AB", kmh, self.frame_idx, tid, ghi_log)
+
+    centers_list = list(centers)
+    if len(centers_list) >= 5 and int(self.frame_idx) - int(tr.get("last_measure_frame", -999)) >= SPEED_MIN_FRAMES_BETWEEN_LINES:
+        f0, x0, y0 = centers_list[0]
+        f1, x1c, y1c = centers_list[-1]
+        df2 = abs(int(f1) - int(f0))
+        if df2 > 0:
+            pixel_distance = ((x1c - x0) ** 2 + (y1c - y0) ** 2) ** 0.5
+            meters_per_pixel = float(self.speed_distance_m_chuan) / max(1.0, abs(line_b_y - line_a_y))
+            dt2 = df2 / max(1.0, float(getattr(self, "fps_video", 25.0) or 25.0))
+            speed_motion = pixel_distance * meters_per_pixel / max(1e-6, dt2) * 3.6
+            _speed_add_measurement(tr, "MOTION", speed_motion, self.frame_idx, tid, ghi_log)
+
+    prev_y = int(tr.get("last_y", cy))
+    dy = cy - prev_y
+    if abs(dy) >= 2:
+        tr["direction"] = 1 if dy > 0 else -1
+
+    confirmed = tr.get("confirmed_speed_kmh")
+    if confirmed is not None and confirmed >= SPEED_MIN_DISPLAY_KMH and not tr.get("confirmed_recorded"):
+        sp = round(float(confirmed), 1)
+        self.speed_done_final_roi.append(sp)
+        self.speed_done_final_roi = self.speed_done_final_roi[-200:]
+        self.speed_by_lane_final_roi.setdefault(lane, []).append(sp)
+        self.speed_by_lane_final_roi[lane] = self.speed_by_lane_final_roi[lane][-80:]
+        tr["confirmed_recorded"] = True
+
     tr.update({"lane": lane, "bbox": bbox, "foot": foot, "last_y": cy, "last_frame": self.frame_idx})
-    return tr.get("speed")
+    return tr.get("confirmed_speed_kmh")
 
 
 def _final_process_frame_roi_speed(self, frame):
@@ -10002,8 +10230,10 @@ def _final_process_frame_roi_speed(self, frame):
         clean = frame.copy()
         t_sec = self.frame_idx / self.fps_video if getattr(self, "fps_video", 0) else time.time()
         rois, median, lanes = _final_all_lanes(w, h)
-        line_a_y = int(h * 0.43)
-        line_b_y = int(h * 0.68)
+        line_a_ratio = _clamp_ratio(getattr(self, "speed_line_a_ratio", SPEED_LINE_A_RATIO), 0.10, 0.85)
+        line_b_ratio = _clamp_ratio(getattr(self, "speed_line_b_ratio", SPEED_LINE_B_RATIO), line_a_ratio + 0.05, 0.95)
+        line_a_y = int(h * line_a_ratio)
+        line_b_y = int(h * line_b_ratio)
 
         class_counts = {name: 0 for name in VEHICLE_CLASSES}
         lane_counts = {label: 0 for label, _, _ in lanes}
@@ -10046,16 +10276,98 @@ def _final_process_frame_roi_speed(self, frame):
 
         self.last_inference_boxes = [(b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10]) for b in boxes]
 
+        preview_history_len = max(1, len(self.vehicle_history) + 1)
+        preview_avg_vehicles = round((sum(self.vehicle_history) + total_in_roi) / preview_history_len)
+        _, preview_vsl_speed, _, _ = tinh_vsl_theo_ngu_canh(preview_avg_vehicles, class_counts, self.config.vsl)
+
         _final_draw_roi(clean, rois, median, lanes, line_a_y, line_b_y, float(self.speed_distance_m_chuan))
 
+        try:
+            current_vsl_for_boxes = int(float(preview_vsl_speed or getattr(self, "last_vsl", None) or getattr(self.config.vsl, "vsl_max", 100)))
+        except Exception:
+            current_vsl_for_boxes = 0
+        violation_tolerance = 5
+        if not isinstance(getattr(self, "violation_saved", None), dict):
+            self.violation_saved = {}
+        if not hasattr(self, "violation_count"):
+            self.violation_count = 0
+        vehicle_speeds = []
+        last_violation = None
+
         for x1, y1, x2, y2, name, confv, color, fx, fy, in_roi, lane_label, tid, sp in boxes:
-            cv2.rectangle(clean, (x1, y1), (x2, y2), color, 2 if in_roi else 1)
+            speed_value = None
+            try:
+                if sp is not None:
+                    speed_value = float(sp)
+            except Exception:
+                speed_value = None
+            track = self.speed_tracks_final_roi.get(tid, {}) if tid is not None else {}
+            measurement_count = len(track.get("measurements", []) or [])
+            has_speed = (
+                speed_value is not None
+                and SPEED_MIN_DISPLAY_KMH <= speed_value <= SPEED_MAX_KMH
+            )
+            is_violation = bool(
+                in_roi
+                and has_speed
+                and current_vsl_for_boxes > 0
+                and speed_value > current_vsl_for_boxes + violation_tolerance
+            )
+            draw_color = (0, 0, 255) if is_violation else color
+            cv2.rectangle(clean, (x1, y1), (x2, y2), draw_color, 3 if is_violation else (2 if in_roi else 1))
             cv2.circle(clean, (fx, fy), 5, (0, 255, 255) if in_roi else color, -1)
             label = f"{name} {confv:.2f}"
             if in_roi:
                 label += f" | ID {tid} | {lane_label}"
-                label += f" | {sp:.1f} km/h" if sp is not None else " | measuring"
-            cv2.putText(clean, label, (x1, max(24, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.50, color, 2, cv2.LINE_AA)
+                if has_speed:
+                    if is_violation:
+                        label += f" | VI PHAM | {speed_value:.1f}>{current_vsl_for_boxes} km/h"
+                    else:
+                        label += f" | {speed_value:.1f} km/h"
+                elif measurement_count > 0:
+                    label += " | dang xac nhan"
+                else:
+                    label += " | dang do"
+                vehicle_speeds.append({
+                    "id": tid,
+                    "speed_kmh": round(speed_value, 1) if has_speed else None,
+                    "lane": lane_label,
+                    "violation": is_violation,
+                    "status": "confirmed" if has_speed else "confirming" if measurement_count > 0 else "measuring",
+                    "measurements": measurement_count,
+                })
+            cv2.putText(clean, label, (x1, max(24, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.50, draw_color, 2, cv2.LINE_AA)
+            if in_roi and not has_speed:
+                cv2.putText(clean, "dang xac nhan" if measurement_count > 0 else "dang do", (x1, min(h - 8, y2 + 22)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 0), 2, cv2.LINE_AA)
+            elif has_speed:
+                cv2.putText(clean, f"ID {tid} | {speed_value:.1f} km/h", (x1, min(h - 8, y2 + 22)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 0, 255) if is_violation else (0, 255, 255), 2, cv2.LINE_AA)
+            if is_violation:
+                cv2.putText(clean, f"VSL: {current_vsl_for_boxes} km/h", (x1, min(h - 8, y2 + 44)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 0, 255), 2, cv2.LINE_AA)
+                key = f"{tid}_{current_vsl_for_boxes}"
+                now = time.time()
+                last_save = float(self.violation_saved.get(key, 0.0) or 0.0)
+                if now - last_save >= 5.0:
+                    try:
+                        violation_dir = Path(getattr(self, "snapshots_dir", Path(OUTPUT_DIR) / "snapshots")) / "violations"
+                        violation_dir.mkdir(parents=True, exist_ok=True)
+                        stamp = time.strftime("%Y%m%d_%H%M%S")
+                        speed_text = f"{speed_value:.1f}".replace("/", "_")
+                        image_path = violation_dir / f"vi_pham_ID{tid}_speed{speed_text}_vsl{current_vsl_for_boxes}_frame{self.frame_idx}_{stamp}.jpg"
+                        if cv2.imwrite(str(image_path), clean):
+                            self.violation_saved[key] = now
+                            self.violation_count += 1
+                            self.snapshot_count += 1
+                            self.warning_count += 1
+                            last_violation = f"Xe ID {tid} vuot VSL: {speed_value:.1f} km/h > {current_vsl_for_boxes} km/h"
+                            self.them_su_kien("VIOLATION", last_violation, t_sec)
+                    except Exception as exc:
+                        try:
+                            self.them_nhat_ky(f"[VIOLATION] Loi luu anh: {exc}")
+                        except Exception:
+                            pass
 
         self.vehicle_history.append(total_in_roi)
         avg_vehicles = round(sum(self.vehicle_history) / max(1, len(self.vehicle_history))) if self.vehicle_history else 0
@@ -10074,6 +10386,21 @@ def _final_process_frame_roi_speed(self, frame):
         else:
             avg_speed = max_speed = min_speed = 0.0
             speed_text = "SPEED: dang cho xe cat du 2 vach A/B"
+        if int(getattr(self, "frame_idx", 0) or 0) % 60 == 0:
+            try:
+                tracks = getattr(self, "speed_tracks_final_roi", {}) or {}
+                confirmed_n = sum(
+                    1 for tr in tracks.values()
+                    if tr.get("confirmed_speed_kmh") is not None
+                    and tr.get("confirmed_speed_kmh") >= SPEED_MIN_DISPLAY_KMH
+                )
+                measuring_n = max(0, len(tracks) - confirmed_n)
+                self.them_nhat_ky(
+                    f"[SPEED DEBUG] tracks={len(tracks)}, confirmed={confirmed_n}, "
+                    f"measuring={measuring_n}, lineA={line_a_y}, lineB={line_b_y}"
+                )
+            except Exception:
+                pass
         cv2.rectangle(clean, (20, 18), (760, 58), (0, 0, 0), -1)
         cv2.putText(clean, speed_text, (30, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.70, (0, 255, 255), 2, cv2.LINE_AA)
 
@@ -10085,7 +10412,10 @@ def _final_process_frame_roi_speed(self, frame):
             by_lane_avg[label] = round(sum(arr[-10:]) / len(arr[-10:]), 1) if arr else 0.0
             by_lane_n[label] = len(arr)
             short = label.replace("LEFT", "L").replace("RIGHT", "R")
-            lane_line.append(f"{short}:{by_lane_avg[label]}km/h/{by_lane_n[label]}")
+            if arr:
+                lane_line.append(f"{short}:{by_lane_avg[label]}km/h/{by_lane_n[label]}")
+            else:
+                lane_line.append(f"{short}:dang do")
         cv2.putText(clean, " | ".join(lane_line[:3]), (30, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 255), 2, cv2.LINE_AA)
         cv2.putText(clean, " | ".join(lane_line[3:]), (30, 106), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 255), 2, cv2.LINE_AA)
 
@@ -10115,7 +10445,11 @@ def _final_process_frame_roi_speed(self, frame):
             "so_xe_da_do_theo_lan": by_lane_n,
             "speed_distance_m": float(self.speed_distance_m_chuan),
             "do_tin_cay_ai": round(sum([b[5] for b in boxes]) / max(1, len(boxes)) * 100, 1) if boxes else 0.0,
+            "vehicle_speeds": vehicle_speeds,
+            "violation_count": int(getattr(self, "violation_count", 0)),
         }
+        if last_violation:
+            self.last_stats["last_violation"] = last_violation
         self.statsReady.emit(self.last_stats)
         return clean
     except Exception as e:
@@ -16403,6 +16737,316 @@ try:
     GiaoDienChinh.update_ui_from_stats = _mission_final_update_ui
 except Exception as _mission_final_chart_exc:
     ghi_log(f"MISSION_CONTROL final callback lỗi: {_mission_final_chart_exc}")
+
+
+# =========================================================
+# FINAL_SPEED_VIOLATION_PATCH
+# Đo tốc độ từng xe, chống cập nhật tracker trùng frame, đánh dấu
+# phương tiện vượt VSL và lưu ảnh vi phạm theo thời gian giới hạn.
+# =========================================================
+try:
+    _final_speed_old_tracker_update = getattr(BoDoTocDoHaiVach, "cap_nhat", None)
+
+    def _final_speed_cached_tracker_update(
+        self,
+        frame_h,
+        detections,
+        frame_idx,
+        fps_video,
+        line_a=None,
+        line_b=None,
+        distance_m=None,
+    ):
+        """Trả lại kết quả đã đo nếu cùng tracker đã xử lý cùng frame."""
+        cache_key = (
+            int(frame_idx),
+            id(detections),
+            int(frame_h),
+            float(line_a if line_a is not None else SPEED_LINE_A_RATIO),
+            float(line_b if line_b is not None else SPEED_LINE_B_RATIO),
+            float(distance_m if distance_m is not None else SPEED_DISTANCE_METERS),
+        )
+        if getattr(self, "_final_speed_cache_key", None) == cache_key:
+            return list(getattr(self, "_final_speed_cache_value", []) or [])
+
+        if _final_speed_old_tracker_update is None:
+            measured = []
+        else:
+            measured = _final_speed_old_tracker_update(
+                self,
+                frame_h=frame_h,
+                detections=detections,
+                frame_idx=frame_idx,
+                fps_video=fps_video,
+                line_a=line_a,
+                line_b=line_b,
+                distance_m=distance_m,
+            ) or []
+
+        self._final_speed_cache_key = cache_key
+        self._final_speed_cache_value = list(measured)
+        return list(measured)
+
+
+    if _final_speed_old_tracker_update is not None:
+        BoDoTocDoHaiVach.cap_nhat = _final_speed_cached_tracker_update
+
+    _final_speed_old_process_frame = XuLyVideo.xu_ly_khung_hinh
+
+    def _final_speed_safe_int(value, default=0):
+        try:
+            return int(float(value))
+        except Exception:
+            return int(default)
+
+
+    def _final_speed_safe_float(value, default=0.0):
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
+
+
+    def _final_speed_process_frame(self, frame):
+        try:
+            frame_out = _final_speed_old_process_frame(self, frame)
+        except Exception as exc:
+            frame_out = frame
+            try:
+                ghi_log(f"FINAL_SPEED_VIOLATION_PATCH process cũ lỗi: {exc}")
+            except Exception:
+                pass
+
+        if frame_out is None or not hasattr(frame_out, "shape"):
+            frame_out = frame
+
+        try:
+            h, w = frame_out.shape[:2]
+        except Exception:
+            return frame_out
+
+        try:
+            detections = getattr(self, "last_inference_boxes", []) or []
+        except Exception:
+            detections = []
+
+        tracker = getattr(self, "speed_tracker", None)
+        if tracker is None or not callable(getattr(tracker, "cap_nhat", None)):
+            try:
+                tracker = BoDoTocDoHaiVach()
+                self.speed_tracker = tracker
+            except Exception:
+                tracker = None
+
+        measured = []
+        if tracker is not None and detections:
+            try:
+                measured = tracker.cap_nhat(
+                    frame_h=h,
+                    detections=detections,
+                    frame_idx=_final_speed_safe_int(getattr(self, "frame_idx", 0), 0),
+                    fps_video=_final_speed_safe_float(getattr(self, "fps_video", 25.0), 25.0),
+                    line_a=getattr(self, "speed_line_a_ratio", SPEED_LINE_A_RATIO),
+                    line_b=getattr(self, "speed_line_b_ratio", SPEED_LINE_B_RATIO),
+                    distance_m=getattr(self, "speed_distance_m", SPEED_DISTANCE_METERS),
+                ) or []
+            except Exception as exc:
+                measured = []
+                try:
+                    ghi_log(f"FINAL_SPEED_VIOLATION_PATCH đo tốc độ lỗi: {exc}")
+                except Exception:
+                    pass
+
+        try:
+            stats = dict(getattr(self, "last_stats", {}) or {})
+        except Exception:
+            stats = {}
+
+        current_vsl = stats.get("suggested_vsl")
+        if current_vsl in (None, ""):
+            current_vsl = getattr(self, "last_vsl", None)
+        if current_vsl in (None, ""):
+            current_vsl = getattr(getattr(getattr(self, "config", None), "vsl", None), "vsl_max", None)
+        try:
+            current_vsl = _final_speed_safe_int(current_vsl, 0)
+        except Exception:
+            current_vsl = 0
+
+        tolerance = _final_speed_safe_int(os.getenv("VSL_VIOLATION_TOLERANCE", "5"), 5)
+        tolerance = max(0, tolerance)
+        speed_min = _final_speed_safe_float(globals().get("SPEED_MIN_KMH", 5.0), 5.0)
+        speed_max = _final_speed_safe_float(globals().get("SPEED_MAX_KMH", 160.0), 160.0)
+        violation_saved = getattr(self, "violation_saved", None)
+        if not isinstance(violation_saved, dict):
+            violation_saved = {}
+            self.violation_saved = violation_saved
+        self.violation_count = _final_speed_safe_int(getattr(self, "violation_count", 0), 0)
+
+        vehicle_speeds = []
+        last_violation = None
+        new_violation = False
+        frame_idx = _final_speed_safe_int(getattr(self, "frame_idx", 0), 0)
+        now = time.time()
+
+        for item in measured:
+            try:
+                tid, speed_kmh, box, lane_label = item
+                x1, y1, x2, y2 = [int(v) for v in box[:4]]
+            except Exception:
+                continue
+
+            speed_value = None
+            try:
+                if speed_kmh is not None:
+                    speed_value = float(speed_kmh)
+            except Exception:
+                speed_value = None
+
+            valid_speed = (
+                speed_value is not None
+                and speed_value > 0
+                and speed_value >= speed_min
+                and speed_value <= speed_max
+            )
+            violation = bool(valid_speed and current_vsl > 0 and speed_value > current_vsl + tolerance)
+
+            x1 = max(0, min(w - 1, x1))
+            x2 = max(0, min(w - 1, x2))
+            y1 = max(0, min(h - 1, y1))
+            y2 = max(0, min(h - 1, y2))
+
+            if speed_value is None or not valid_speed:
+                label = f"ID {tid} | dang do"
+                label_color = (0, 255, 255)
+            elif violation:
+                label = f"VI PHAM | ID {tid} | {speed_value:.1f}>{current_vsl} km/h"
+                label_color = (0, 0, 255)
+                cv2.rectangle(frame_out, (x1, y1), (x2, y2), (0, 0, 255), 3)
+                cv2.putText(
+                    frame_out,
+                    f"VSL hien tai: {current_vsl} km/h",
+                    (x1, min(h - 8, max(22, y2 + 22))),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.50,
+                    (0, 0, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+            else:
+                label = f"ID {tid} | {speed_value:.1f} km/h"
+                label_color = (0, 220, 0)
+
+            text_size = cv2.getTextSize(
+                label, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1
+            )[0]
+            tx = max(0, min(w - text_size[0] - 12, x1))
+            ty = max(20, y1 - 8)
+            cv2.rectangle(
+                frame_out,
+                (tx, max(0, ty - text_size[1] - 8)),
+                (min(w - 1, tx + text_size[0] + 10), min(h - 1, ty + 4)),
+                (0, 0, 0),
+                -1,
+            )
+            cv2.putText(
+                frame_out,
+                label,
+                (tx + 5, ty),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                label_color,
+                1,
+                cv2.LINE_AA,
+            )
+
+            row = {
+                "id": tid,
+                "speed_kmh": round(speed_value, 1) if speed_value is not None else None,
+                "lane": lane_label,
+                "violation": violation,
+            }
+            vehicle_speeds.append(row)
+
+            if not violation:
+                continue
+
+            message = f"Xe ID {tid} vượt VSL: {speed_value:.1f} km/h > {current_vsl} km/h"
+            last_violation = message
+            key = f"{tid}_{int(current_vsl)}"
+            last_save = _final_speed_safe_float(violation_saved.get(key, 0), 0.0)
+            if now - last_save < 5.0:
+                continue
+
+            try:
+                root = getattr(self, "snapshots_dir", None)
+                if root is None:
+                    root = Path(OUTPUT_DIR) / "violations"
+                violation_dir = Path(root) / "violations"
+                violation_dir.mkdir(parents=True, exist_ok=True)
+                stamp = time.strftime("%Y%m%d_%H%M%S")
+                speed_text = f"{speed_value:.1f}".replace("/", "_")
+                filename = (
+                    f"violation_ID{tid}_speed{speed_text}_vsl{current_vsl}_"
+                    f"frame{frame_idx}_{stamp}.jpg"
+                )
+                image_path = violation_dir / filename
+                if cv2.imwrite(str(image_path), frame_out):
+                    violation_saved[key] = now
+                    self.violation_count += 1
+                    new_violation = True
+                    if hasattr(self, "warning_count"):
+                        self.warning_count = _final_speed_safe_int(self.warning_count, 0) + 1
+                    try:
+                        t_sec = frame_idx / max(
+                            1.0,
+                            _final_speed_safe_float(getattr(self, "fps_video", 25.0), 25.0),
+                        )
+                        if callable(getattr(self, "them_su_kien", None)):
+                            self.them_su_kien("VIOLATION", message, t_sec)
+                        elif callable(getattr(self, "them_nhat_ky", None)):
+                            self.them_nhat_ky(message)
+                    except Exception:
+                        pass
+            except Exception as exc:
+                try:
+                    ghi_log(f"FINAL_SPEED_VIOLATION_PATCH lưu ảnh lỗi: {exc}")
+                except Exception:
+                    pass
+
+        stats["vehicle_speeds"] = vehicle_speeds
+        stats["violation_count"] = self.violation_count
+        if last_violation is not None:
+            stats["last_violation"] = last_violation
+        self.last_stats = stats
+
+        if new_violation or frame_idx % 10 == 0:
+            try:
+                self.statsReady.emit(stats)
+            except Exception:
+                pass
+
+        try:
+            line_a = int(h * _final_speed_safe_float(getattr(self, "speed_line_a_ratio", SPEED_LINE_A_RATIO), SPEED_LINE_A_RATIO))
+            line_b = int(h * _final_speed_safe_float(getattr(self, "speed_line_b_ratio", SPEED_LINE_B_RATIO), SPEED_LINE_B_RATIO))
+            cv2.line(frame_out, (0, line_a), (w - 1, line_a), (255, 0, 0), 2)
+            cv2.line(frame_out, (0, line_b), (w - 1, line_b), (0, 165, 255), 2)
+            cv2.putText(frame_out, "Line A - bat dau do toc do", (12, max(20, line_a - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 0, 0), 1, cv2.LINE_AA)
+            cv2.putText(frame_out, "Line B - ket thuc do toc do", (12, max(20, line_b - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 165, 255), 1, cv2.LINE_AA)
+        except Exception:
+            pass
+
+        return frame_out
+
+
+    # Khối vẽ box/tốc độ/vi phạm đã được xử lý trực tiếp trong
+    # XuLyVideo.xu_ly_khung_hinh gốc; không bọc lại frame để tránh đo và vẽ trùng.
+    if _final_speed_old_tracker_update is not None:
+        BoDoTocDoHaiVach.cap_nhat = _final_speed_old_tracker_update
+except Exception as _final_speed_violation_patch_exc:
+    try:
+        ghi_log(f"FINAL_SPEED_VIOLATION_PATCH loi: {_final_speed_violation_patch_exc}")
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

@@ -2,27 +2,27 @@
   "y_top": 0.36,
   "y_bot": 0.92,
   "left_road": {
-    "top_left_x": 0.27,
-    "top_right_x": 0.49,
+    "top_left_x": 0.39,
+    "top_right_x": 0.46,
     "bottom_left_x": 0.0,
-    "bottom_right_x": 0.31,
-    "y_top": 0.36,
-    "y_bot": 0.92
+    "bottom_right_x": 0.36,
+    "y_top": 0.18,
+    "y_bot": 0.74
   },
   "right_road": {
-    "top_left_x": 0.57,
-    "top_right_x": 0.67,
-    "bottom_left_x": 0.57,
-    "bottom_right_x": 0.97,
-    "y_top": 0.3,
-    "y_bot": 0.92
+    "top_left_x": 0.47,
+    "top_right_x": 0.51,
+    "bottom_left_x": 0.59,
+    "bottom_right_x": 0.93,
+    "y_top": 0.14,
+    "y_bot": 0.7
   },
   "median": {
-    "top_left_x": 0.37,
-    "top_right_x": 0.52,
-    "bottom_right_x": 0.57,
-    "bottom_left_x": 0.43,
-    "y_top": 0.51,
-    "y_bot": 0.96
+    "top_left_x": 0.47,
+    "top_right_x": 0.47,
+    "bottom_right_x": 0.58,
+    "bottom_left_x": 0.33,
+    "y_top": 0.13,
+    "y_bot": 0.93
   }
 }
