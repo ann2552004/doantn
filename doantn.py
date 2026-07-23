@@ -30,8 +30,51 @@ import subprocess
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from collections import deque
+
+
+def _configure_qt_plugins_for_windows():
+    """Configure PyQt5's bundled Qt plugins before importing Qt modules."""
+    if os.name != "nt":
+        return
+
+    for variable in (
+        "QT_PLUGIN_PATH",
+        "QT_QPA_PLATFORM_PLUGIN_PATH",
+        "QT_QPA_PLATFORM",
+    ):
+        os.environ.pop(variable, None)
+
+    try:
+        import PyQt5
+
+        pyqt_dir = Path(PyQt5.__file__).resolve().parent
+        qt_plugins = pyqt_dir / "Qt5" / "plugins"
+        platforms_dir = qt_plugins / "platforms"
+        qwindows_dll = platforms_dir / "qwindows.dll"
+
+        if not qwindows_dll.exists():
+            print(
+                "Qt platform plugin missing: " + str(qwindows_dll),
+                file=sys.stderr,
+            )
+            return
+
+        os.environ["QT_PLUGIN_PATH"] = str(qt_plugins)
+        os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = str(platforms_dir)
+        os.environ["QT_QPA_PLATFORM"] = "windows"
+    except Exception as exc:
+        print(
+            "Unable to configure Qt platform plugins: " + repr(exc),
+            file=sys.stderr,
+        )
+
+
+_configure_qt_plugins_for_windows()
+
 import cv2
 import numpy as np
+
+_configure_qt_plugins_for_windows()
 
 
 
